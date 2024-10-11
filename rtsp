@@ -1,0 +1,331 @@
+# RTSP摄像头认证系统
+
+本文档包含了RTSP摄像头认证系统的主要组件代码。
+
+文件结构
+```
+src/
+├── camera/
+│   ├── __init__.py
+│   ├── camera.py
+│   ├── rtsp_client.py
+│   ├── authentication_result.py
+│   ├── response_handlers.py
+│   └── rtsp_authenticator.py
+└── main.py
+```
+代码内容
+
+1. src/camera/camera.py
+
+from dataclasses import dataclass
+
+@dataclass
+class Camera:
+    """表示RTSP摄像头的类"""
+    ip: str
+    port: int
+    username: str
+    password: str
+
+    def get_rtsp_url(self) -> str:
+        """返回摄像头的RTSP URL"""
+        return f"rtsp://{self.ip}:{self.port}"
+
+2. src/camera/rtsp_client.py
+
+import asyncio
+import base64
+from .camera import Camera
+
+class RTSPClient:
+    """处理RTSP协议通信的客户端类"""
+
+    def __init__(self, camera: Camera):
+        self.camera = camera
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
+
+    async def connect(self, timeout: float = 5.0):
+        """建立与RTSP服务器的连接，带有超时机制"""
+        try:
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.camera.ip, self.camera.port),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"连接到 {self.camera.ip}:{self.camera.port} 超时")
+
+    async def disconnect(self):
+        """关闭与RTSP服务器的连接"""
+        if self.writer:
+            self.writer.close()
+            await self.writer.wait_closed()
+            self.reader = self.writer = None
+
+    async def send_request(self, request: str) -> str:
+        """发送RTSP请求并返回响应"""
+        self.writer.write(request.encode())
+        await self.writer.drain()
+        response = await self.reader.read(4096)
+        return response.decode()
+
+    def create_options_request(self, cseq: int, auth_header: str | None = None) -> str:
+        """创建RTSP OPTIONS请求"""
+        request = (
+            f"OPTIONS {self.camera.get_rtsp_url()} RTSP/1.0\r\n"
+            f"CSeq: {cseq}\r\n"
+            f"User-Agent: Python RTSP Client\r\n"
+        )
+        if auth_header:
+            request += f"{auth_header}\r\n"
+        request += "\r\n"
+        return request
+
+    def create_auth_header(self, realm: str, nonce: str) -> str:
+        """创建RTSP认证头"""
+        auth_string = f"{self.camera.username}:{realm}:{self.camera.password}"
+        auth_hash = base64.b64encode(auth_string.encode()).decode()
+        return (f'Authorization: Digest username="{self.camera.username}", '
+                f'realm="{realm}", nonce="{nonce}", '
+                f'uri="{self.camera.get_rtsp_url()}", '
+                f'response="{auth_hash}"')
+
+3. src/camera/authentication_result.py
+
+from dataclasses import dataclass, field
+from typing import Dict, Any
+
+@dataclass
+class AuthenticationResult:
+    """封装RTSP认证结果的类"""
+    success: bool = False
+    message: str = ""
+    camera: Dict[str, Any] = field(default_factory=dict)
+    needs_auth: bool = False
+    realm: str = ""
+    nonce: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """将结果转换为字典形式"""
+        return {
+            "success": self.success,
+            "message": self.message,
+            "camera": self.camera,
+            "needs_auth": self.needs_auth,
+            "realm": self.realm,
+            "nonce": self.nonce
+        }
+
+    def set_camera_info(self, ip: str, port: int, username: str):
+        """设置摄像头信息"""
+        self.camera = {
+            "ip": ip,
+            "port": port,
+            "username": username
+        }
+
+    def set_auth_params(self, realm: str, nonce: str):
+        """设置认证参数"""
+        self.needs_auth = True
+        self.realm = realm
+        self.nonce = nonce
+
+    def set_success(self, message: str = "认证成功"):
+        """设置认证成功"""
+        self.success = True
+        self.message = message
+
+    def set_failure(self, message: str):
+        """设置认证失败"""
+        self.success = False
+        self.message = message
+
+4. src/camera/response_handlers.py
+
+from abc import ABC, abstractmethod
+import re
+from .authentication_result import AuthenticationResult
+
+class ResponseHandler(ABC):
+    """响应处理器的抽象基类"""
+
+    def __init__(self):
+        self.next_handler: ResponseHandler | None = None
+
+    def set_next(self, handler: 'ResponseHandler') -> 'ResponseHandler':
+        """设置责任链中的下一个处理器"""
+        self.next_handler = handler
+        return handler
+
+    @abstractmethod
+    def handle(self, response: str, result: AuthenticationResult) -> bool:
+        """处理响应的抽象方法"""
+        pass
+
+class OkResponseHandler(ResponseHandler):
+    """处理200 OK响应的处理器"""
+
+    def handle(self, response: str, result: AuthenticationResult) -> bool:
+        if "200 OK" in response:
+            result.set_success("不需要认证")
+            return True
+        return self.next_handler.handle(response, result) if self.next_handler else False
+
+class UnauthorizedResponseHandler(ResponseHandler):
+    """处理401 Unauthorized响应的处理器"""
+
+    def __init__(self, auth_param_parser):
+        super().__init__()
+        self.auth_param_parser = auth_param_parser
+
+    def handle(self, response: str, result: AuthenticationResult) -> bool:
+        if "401 Unauthorized" in response:
+            realm, nonce = self.auth_param_parser(response)
+            if realm and nonce:
+                result.set_auth_params(realm, nonce)
+                return True
+            else:
+                result.set_failure("无法提取认证信息")
+                return True
+        return self.next_handler.handle(response, result) if self.next_handler else False
+
+class UnknownResponseHandler(ResponseHandler):
+    """处理未知响应的处理器"""
+
+    def handle(self, response: str, result: AuthenticationResult) -> bool:
+        result.set_failure("未知错误")
+        return True
+
+def parse_auth_params(response: str) -> tuple[str | None, str | None]:
+    """从响应中解析认证参数"""
+    realm_match = re.search(r'realm="([^"]+)"', response)
+    nonce_match = re.search(r'nonce="([^"]+)"', response)
+    if realm_match and nonce_match:
+        return realm_match.group(1), nonce_match.group(1)
+    return None, None
+
+5. src/camera/rtsp_authenticator.py
+
+import asyncio
+import json
+from .rtsp_client import RTSPClient
+from .response_handlers import OkResponseHandler, UnauthorizedResponseHandler, UnknownResponseHandler, parse_auth_params
+from .authentication_result import AuthenticationResult
+
+class RTSPAuthenticator:
+    """RTSP认证器类"""
+
+    def __init__(self, rtsp_client: RTSPClient):
+        self.rtsp_client = rtsp_client
+        self.response_handler = self.setup_response_chain()
+
+    def setup_response_chain(self):
+        """设置响应处理器的责任链"""
+        ok_handler = OkResponseHandler()
+        unauthorized_handler = UnauthorizedResponseHandler(parse_auth_params)
+        unknown_handler = UnknownResponseHandler()
+
+        ok_handler.set_next(unauthorized_handler).set_next(unknown_handler)
+        return ok_handler
+
+    async def verify_credentials(self, timeout: float = 10.0) -> str:
+        """验证RTSP凭据并返回JSON格式的结果，带有总体超时机制"""
+        result = AuthenticationResult()
+        result.set_camera_info(
+            self.rtsp_client.camera.ip,
+            self.rtsp_client.camera.port,
+            self.rtsp_client.camera.username
+        )
+
+        try:
+            async with asyncio.timeout(timeout):
+                await self.rtsp_client.connect()
+
+                # 发送初始OPTIONS请求
+                initial_request = self.rtsp_client.create_options_request(cseq=1)
+                initial_response = await self.rtsp_client.send_request(initial_request)
+
+                self.response_handler.handle(initial_response, result)
+                if result.needs_auth:
+                    # 发送带认证的OPTIONS请求
+                    auth_header = self.rtsp_client.create_auth_header(result.realm, result.nonce)
+                    auth_request = self.rtsp_client.create_options_request(cseq=2, auth_header=auth_header)
+                    auth_response = await self.rtsp_client.send_request(auth_request)
+
+                    if "200 OK" in auth_response:
+                        result.set_success()
+                    else:
+                        result.set_failure("认证失败")
+
+        except asyncio.TimeoutError:
+            result.set_failure("操作超时")
+        except Exception as e:
+            result.set_failure(f"发生错误: {str(e)}")
+        finally:
+            await self.rtsp_client.disconnect()
+
+        return json.dumps(result.to_dict(), ensure_ascii=False)
+
+6. src/main.py
+
+import asyncio
+import json
+import logging
+from typing import List
+from src.camera.camera import Camera
+from src.camera.rtsp_client import RTSPClient
+from src.camera.rtsp_authenticator import RTSPAuthenticator
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+async def process_camera(camera: Camera, semaphore: asyncio.Semaphore) -> dict:
+    async with semaphore:
+        try:
+            rtsp_client = RTSPClient(camera)
+            authenticator = RTSPAuthenticator(rtsp_client)
+            result_json = await authenticator.verify_credentials()
+            return json.loads(result_json)
+        except Exception as e:
+            logger.error(f"处理摄像头 {camera.ip} 时发生错误: {str(e)}")
+            return {"success": False, "message": f"处理错误: {str(e)}"}
+
+async def process_cameras(cameras: List[Camera], max_concurrent: int = 10):
+    semaphore = asyncio.Semaphore(max_concurrent)
+    tasks = [process_camera(camera, semaphore) for camera in cameras]
+    results = await asyncio.gather(*tasks)
+    return results
+
+async def authenticate_cameras():
+    # 创建摄像头列表 (实际使用时应从配置文件或数据库加载)
+    cameras = [
+        Camera(ip=f"192.168.1.{i}", port=554, username=f"user{i}", password=f"pass{i}")
+        for i in range(1, 101)
+    ]
+
+    results = await process_cameras(cameras)
+
+    # 处理结果
+    for i, result in enumerate(results, 1):
+        logger.info(f"摄像头 {i} 验证结果:")
+        logger.info(f"  是否成功: {'是' if result['success'] else '否'}")
+        logger.info(f"  消息: {result['message']}")
+
+    return results
+
+async def main():
+    logger.info("开始摄像头认证过程")
+    authentication_results = await authenticate_cameras()
+    logger.info("摄像头认证过程完成")
+    # 这里可以添加对认证结果的进一步处理
+    
+if __name__ == "__main__":
+    asyncio.run(main())
+
+requirements.txt
+
+aiohttp==3.8.4
+pyyaml==6.0
+
+注意：请确保在 src/camera/ 目录下创建一个空的 __init__.py 文件，以使 Python 将该目录视为一个包。
